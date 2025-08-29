@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import websockets
+import httpx
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -13,12 +14,16 @@ load_dotenv()
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
 SYSTEM_MESSAGE = (
     "You are a helpful and bubbly AI assistant who loves to chat about "
-    "Tu eres un asistente de mucha ayuda y ama chatear"
-    "Eres alguien que le gusta ayudar, siempre positivo y habla con un poco de chistes"
+    "anything the user is interested in and can also provide weather information. "
+    "Tu eres un asistente de mucha ayuda y ama chatear sobre cualquier tema "
+    "y también puedes proporcionar información del clima. "
+    "Eres alguien que le gusta ayudar, siempre positivo y habla con un poco de chistes. "
+    "When users ask about weather, you can use the weather API to get real-time information."
 )
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
@@ -34,9 +39,18 @@ app = FastAPI()
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
 
+if not OPENWEATHER_API_KEY:
+    print('Warning: Missing OpenWeather API key. Weather functionality will be disabled.')
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
+
+@app.get("/weather/{city}", response_class=JSONResponse)
+async def get_weather_endpoint(city: str):
+    """Test endpoint to get weather for a specific city."""
+    weather_info = await get_weather(city)
+    return weather_info
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
@@ -114,6 +128,25 @@ async def handle_media_stream(websocket: WebSocket):
                     response = json.loads(openai_message)
                     if response['type'] in LOG_EVENT_TYPES:
                         print(f"Received event: {response['type']}", response)
+
+                    # Handle tool calls for weather functionality
+                    if response.get('type') == 'tool_calls.delta' and response.get('tool_calls'):
+                        for tool_call in response['tool_calls']:
+                            if tool_call.get('function', {}).get('name') == 'get_weather':
+                                city = tool_call['function']['arguments'].get('city', '')
+                                if city:
+                                    print(f"Weather tool call for city: {city}")
+                                    weather_result = await get_weather(city)
+                                    
+                                    # Send tool result back to OpenAI
+                                    tool_result = {
+                                        "type": "tool_result",
+                                        "tool_result": {
+                                            "tool_call_id": tool_call.get('id', ''),
+                                            "content": json.dumps(weather_result, ensure_ascii=False)
+                                        }
+                                    }
+                                    await openai_ws.send(json.dumps(tool_result))
 
                     if response.get('type') == 'response.output_audio.delta' and 'delta' in response:
                         audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
@@ -205,6 +238,51 @@ async def send_initial_conversation_item(openai_ws):
     await openai_ws.send(json.dumps({"type": "response.create"}))
 
 
+async def get_weather(city: str) -> dict:
+    """Get weather information for a specific city using OpenWeatherMap API."""
+    if not OPENWEATHER_API_KEY:
+        return {"error": "Weather API key not configured"}
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # OpenWeatherMap API endpoint
+            url = f"http://api.openweathermap.org/data/2.5/weather"
+            params = {
+                "q": city,
+                "appid": OPENWEATHER_API_KEY,
+                "units": "metric",  # Use Celsius
+                "lang": "es"  # Spanish language
+            }
+            
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            
+            weather_data = response.json()
+            
+            # Extract relevant information
+            weather_info = {
+                "city": weather_data["name"],
+                "country": weather_data["sys"]["country"],
+                "temperature": round(weather_data["main"]["temp"]),
+                "feels_like": round(weather_data["main"]["feels_like"]),
+                "humidity": weather_data["main"]["humidity"],
+                "description": weather_data["weather"][0]["description"],
+                "wind_speed": round(weather_data["wind"]["speed"] * 3.6),  # Convert m/s to km/h
+                "pressure": weather_data["main"]["pressure"]
+            }
+            
+            return weather_info
+            
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return {"error": f"Ciudad '{city}' no encontrada"}
+        elif e.response.status_code == 401:
+            return {"error": "API key inválida para OpenWeatherMap"}
+        else:
+            return {"error": f"Error HTTP: {e.response.status_code}"}
+    except Exception as e:
+        return {"error": f"Error al consultar el clima: {str(e)}"}
+
 async def initialize_session(openai_ws):
     """Control initial session with OpenAI."""
     session_update = {
@@ -223,6 +301,25 @@ async def initialize_session(openai_ws):
                 }
             },
             "instructions": SYSTEM_MESSAGE,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get current weather information for a specific city",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {
+                                    "type": "string",
+                                    "description": "The name of the city to get weather for"
+                                }
+                            },
+                            "required": ["city"]
+                        }
+                    }
+                }
+            ]
         }
     }
     print('Sending session update:', json.dumps(session_update))
